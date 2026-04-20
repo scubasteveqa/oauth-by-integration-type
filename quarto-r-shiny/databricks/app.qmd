@@ -1,0 +1,204 @@
+---
+title: "Databricks Dashboard (find by type)"
+format: dashboard
+server: shiny
+---
+
+```{r}
+#| context: setup
+library(DBI)
+library(odbc)
+library(connectapi)
+library(plotly)
+library(dplyr)
+
+fetch_databricks <- function(access_token) {
+  conn <- dbConnect(
+    odbc::databricks(),
+    httpPath = Sys.getenv("DATABRICKS_PATH"),
+    authMech = 11,
+    auth_flow = 0,
+    auth_accesstoken = access_token
+  )
+  on.exit(dbDisconnect(conn))
+
+  df <- dbGetQuery(conn, "
+    SELECT
+      t.dateTime,
+      t.product,
+      t.quantity,
+      t.totalPrice,
+      c.continent,
+      c.country,
+      f.name AS franchise_name
+    FROM samples.bakehouse.sales_transactions t
+    JOIN samples.bakehouse.sales_customers c
+      ON t.customerID = c.customerID
+    JOIN samples.bakehouse.sales_franchises f
+      ON t.franchiseID = f.franchiseID
+  ")
+  names(df) <- tolower(names(df))
+  df$datetime <- as.POSIXct(df$datetime)
+  df$month <- format(df$datetime, "%Y-%m")
+  df
+}
+```
+
+# {.sidebar}
+
+OAuth via `get_associations()` + filter by template
+
+```{r}
+actionButton("load_data", "Refresh Data", class = "btn-primary w-100")
+tags$script(HTML(
+  "setTimeout(function() { document.getElementById('load_data').click(); }, 500);"
+))
+tags$hr()
+selectInput("continent", "Continent", choices = "All", selected = "All")
+selectInput("franchise", "Franchise", choices = "All", selected = "All")
+```
+
+```{r}
+#| context: server
+
+raw_data <- reactiveVal(NULL)
+
+observeEvent(input$load_data, {
+  session_token <- session$request$HTTP_POSIT_CONNECT_USER_SESSION_TOKEN
+  if (is.null(session_token) || session_token == "") {
+    showNotification("No session token found. Deploy on Posit Connect.",
+                     type = "error")
+    return()
+  }
+
+  client <- connectapi::connect()
+  current_content <- connectapi::content_item(client, Sys.getenv("CONNECT_CONTENT_GUID"))
+  associations <- connectapi::get_associations(current_content)
+
+  db_assoc <- Filter(function(a) a$oauth_integration_template == "databricks", associations)
+
+  if (length(db_assoc) == 0) {
+    showNotification("No Databricks integration found on this content", type = "error")
+    return()
+  }
+
+  db_guid <- db_assoc[[1]]$oauth_integration_guid
+
+  tryCatch({
+    creds <- connectapi::get_oauth_credentials(client, session_token, audience = db_guid)
+    df <- fetch_databricks(creds$access_token)
+    raw_data(df)
+
+    updateSelectInput(session, "continent",
+                      choices = c("All", sort(unique(df$continent))), selected = "All")
+    updateSelectInput(session, "franchise",
+                      choices = c("All", sort(unique(df$franchise_name))), selected = "All")
+
+    showNotification(paste("Databricks:", nrow(df), "rows"), type = "message")
+  }, error = function(e) {
+    showNotification(paste("Databricks error:", conditionMessage(e)),
+                     type = "error", duration = 10)
+  })
+})
+
+filtered <- reactive({
+  df <- raw_data()
+  if (is.null(df)) return(NULL)
+  if (input$continent != "All") df <- df[df$continent == input$continent, ]
+  if (input$franchise != "All") df <- df[df$franchise_name == input$franchise, ]
+  df
+})
+```
+
+# Databricks Bakehouse
+
+## Row
+
+::: {.valuebox title="Revenue" icon="currency-dollar" color="primary"}
+```{r}
+renderText({
+  df <- filtered()
+  if (is.null(df)) return("--")
+  paste0("$", formatC(sum(df$totalprice), format = "f", digits = 2, big.mark = ","))
+})
+```
+:::
+
+::: {.valuebox title="Orders" icon="cart" color="info"}
+```{r}
+renderText({
+  df <- filtered()
+  if (is.null(df)) return("--")
+  formatC(nrow(df), format = "d", big.mark = ",")
+})
+```
+:::
+
+::: {.valuebox title="Franchises" icon="shop" color="warning"}
+```{r}
+renderText({
+  df <- filtered()
+  if (is.null(df)) return("--")
+  as.character(length(unique(df$franchise_name)))
+})
+```
+:::
+
+## Row
+
+### Column
+
+```{r}
+#| title: Revenue by Franchise
+plotlyOutput("chart_franchise")
+```
+
+```{r}
+#| context: server
+output$chart_franchise <- renderPlotly({
+  df <- filtered()
+  if (is.null(df)) return(plot_ly() |> layout(title = "Loading..."))
+  agg <- df |>
+    group_by(franchise_name) |>
+    summarise(revenue = sum(totalprice), .groups = "drop") |>
+    arrange(revenue)
+  agg$franchise_name <- factor(agg$franchise_name, levels = agg$franchise_name)
+  plot_ly(agg, x = ~revenue, y = ~franchise_name, type = "bar", orientation = "h") |>
+    layout(xaxis = list(title = "Revenue ($)"), yaxis = list(title = "Franchise"))
+})
+```
+
+### Column
+
+```{r}
+#| title: Revenue by Continent
+plotlyOutput("chart_continent")
+```
+
+```{r}
+#| context: server
+output$chart_continent <- renderPlotly({
+  df <- filtered()
+  if (is.null(df)) return(plot_ly() |> layout(title = "Loading..."))
+  agg <- df |> group_by(continent) |> summarise(revenue = sum(totalprice), .groups = "drop")
+  plot_ly(agg, labels = ~continent, values = ~revenue, type = "pie")
+})
+```
+
+## Row
+
+```{r}
+#| title: Monthly Revenue Trend
+plotlyOutput("chart_trend")
+```
+
+```{r}
+#| context: server
+output$chart_trend <- renderPlotly({
+  df <- filtered()
+  if (is.null(df)) return(plot_ly() |> layout(title = "Loading..."))
+  agg <- df |> group_by(month) |> summarise(total = sum(totalprice), .groups = "drop") |> arrange(month)
+  plot_ly(agg, x = ~month, y = ~total, type = "scatter", mode = "lines+markers") |>
+    layout(xaxis = list(title = "Month"), yaxis = list(title = "Revenue ($)"))
+})
+```

@@ -1,0 +1,348 @@
+---
+title: "Multi-Source Dashboard (find by type)"
+format: dashboard
+server: shiny
+---
+
+```{r}
+#| context: setup
+library(DBI)
+library(odbc)
+library(connectapi)
+library(plotly)
+library(dplyr)
+
+fetch_snowflake <- function(access_token) {
+  conn <- dbConnect(
+    odbc::odbc(),
+    driver = "Snowflake",
+    Server = paste0(Sys.getenv("SNOWFLAKE_ACCOUNT"), ".snowflakecomputing.com"),
+    Database = Sys.getenv("SNOWFLAKE_DATABASE"),
+    Schema = Sys.getenv("SNOWFLAKE_SCHEMA"),
+    Warehouse = Sys.getenv("SNOWFLAKE_WAREHOUSE"),
+    Authenticator = "oauth",
+    Token = access_token
+  )
+  on.exit(dbDisconnect(conn))
+
+  df <- dbGetQuery(conn, "SELECT * FROM SALES")
+  names(df) <- toupper(names(df))
+  df$SALE_DATE <- as.Date(df$SALE_DATE)
+  df$MONTH <- format(df$SALE_DATE, "%Y-%m")
+  df
+}
+
+fetch_databricks <- function(access_token) {
+  conn <- dbConnect(
+    odbc::databricks(),
+    httpPath = Sys.getenv("DATABRICKS_PATH"),
+    authMech = 11,
+    auth_flow = 0,
+    auth_accesstoken = access_token
+  )
+  on.exit(dbDisconnect(conn))
+
+  df <- dbGetQuery(conn, "
+    SELECT
+      t.dateTime,
+      t.product,
+      t.quantity,
+      t.totalPrice,
+      c.continent,
+      c.country,
+      f.name AS franchise_name
+    FROM samples.bakehouse.sales_transactions t
+    JOIN samples.bakehouse.sales_customers c
+      ON t.customerID = c.customerID
+    JOIN samples.bakehouse.sales_franchises f
+      ON t.franchiseID = f.franchiseID
+  ")
+  names(df) <- tolower(names(df))
+  df$datetime <- as.POSIXct(df$datetime)
+  df$month <- format(df$datetime, "%Y-%m")
+  df
+}
+```
+
+# {.sidebar}
+
+Snowflake + Databricks via `get_associations()` + filter by template
+
+```{r}
+actionButton("load_data", "Refresh All Data", class = "btn-primary w-100")
+tags$script(HTML(
+  "setTimeout(function() { document.getElementById('load_data').click(); }, 500);"
+))
+tags$hr()
+tags$label("Snowflake Filters", style = "font-weight: 600;")
+selectInput("sf_category", "Category", choices = "All", selected = "All")
+selectInput("sf_region", "Region", choices = "All", selected = "All")
+tags$hr()
+tags$label("Databricks Filters", style = "font-weight: 600;")
+selectInput("db_continent", "Continent", choices = "All", selected = "All")
+selectInput("db_franchise", "Franchise", choices = "All", selected = "All")
+```
+
+```{r}
+#| context: server
+
+sf_data <- reactiveVal(NULL)
+db_data <- reactiveVal(NULL)
+
+observeEvent(input$load_data, {
+  session_token <- session$request$HTTP_POSIT_CONNECT_USER_SESSION_TOKEN
+  if (is.null(session_token) || session_token == "") {
+    showNotification("No session token found. Deploy on Posit Connect.",
+                     type = "error")
+    return()
+  }
+
+  client <- connectapi::connect()
+  current_content <- connectapi::content_item(client, Sys.getenv("CONNECT_CONTENT_GUID"))
+  associations <- connectapi::get_associations(current_content)
+
+  sf_assoc <- Filter(function(a) a$oauth_integration_template == "snowflake", associations)
+  db_assoc <- Filter(function(a) a$oauth_integration_template == "databricks", associations)
+
+  if (length(sf_assoc) == 0 || length(db_assoc) == 0) {
+    showNotification(
+      paste0("Missing: snowflake=", length(sf_assoc) > 0,
+             ", databricks=", length(db_assoc) > 0),
+      type = "error"
+    )
+    return()
+  }
+
+  sf_guid <- sf_assoc[[1]]$oauth_integration_guid
+  db_guid <- db_assoc[[1]]$oauth_integration_guid
+
+  # Fetch Snowflake
+  tryCatch({
+    sf_creds <- connectapi::get_oauth_credentials(client, session_token, audience = sf_guid)
+    df_sf <- fetch_snowflake(sf_creds$access_token)
+    sf_data(df_sf)
+
+    updateSelectInput(session, "sf_category",
+                      choices = c("All", sort(unique(df_sf$CATEGORY))), selected = "All")
+    updateSelectInput(session, "sf_region",
+                      choices = c("All", sort(unique(df_sf$REGION))), selected = "All")
+
+    showNotification(paste("Snowflake:", nrow(df_sf), "rows"), type = "message")
+  }, error = function(e) {
+    showNotification(paste("Snowflake error:", conditionMessage(e)),
+                     type = "error", duration = 10)
+  })
+
+  # Fetch Databricks
+  tryCatch({
+    db_creds <- connectapi::get_oauth_credentials(client, session_token, audience = db_guid)
+    df_db <- fetch_databricks(db_creds$access_token)
+    db_data(df_db)
+
+    updateSelectInput(session, "db_continent",
+                      choices = c("All", sort(unique(df_db$continent))), selected = "All")
+    updateSelectInput(session, "db_franchise",
+                      choices = c("All", sort(unique(df_db$franchise_name))), selected = "All")
+
+    showNotification(paste("Databricks:", nrow(df_db), "rows"), type = "message")
+  }, error = function(e) {
+    showNotification(paste("Databricks error:", conditionMessage(e)),
+                     type = "error", duration = 10)
+  })
+})
+
+sf_filtered <- reactive({
+  df <- sf_data()
+  if (is.null(df)) return(NULL)
+  if (input$sf_category != "All") df <- df[df$CATEGORY == input$sf_category, ]
+  if (input$sf_region != "All") df <- df[df$REGION == input$sf_region, ]
+  df
+})
+
+db_filtered <- reactive({
+  df <- db_data()
+  if (is.null(df)) return(NULL)
+  if (input$db_continent != "All") df <- df[df$continent == input$db_continent, ]
+  if (input$db_franchise != "All") df <- df[df$franchise_name == input$db_franchise, ]
+  df
+})
+```
+
+# Snowflake Sales
+
+## Row
+
+::: {.valuebox title="SF Total Sales" icon="currency-dollar" color="primary"}
+```{r}
+renderText({
+  df <- sf_filtered()
+  if (is.null(df)) return("--")
+  paste0("$", formatC(sum(df$TOTAL_AMOUNT), format = "f", digits = 2, big.mark = ","))
+})
+```
+:::
+
+::: {.valuebox title="SF Orders" icon="cart" color="info"}
+```{r}
+renderText({
+  df <- sf_filtered()
+  if (is.null(df)) return("--")
+  formatC(nrow(df), format = "d", big.mark = ",")
+})
+```
+:::
+
+::: {.valuebox title="SF Avg Order" icon="calculator" color="success"}
+```{r}
+renderText({
+  df <- sf_filtered()
+  if (is.null(df) || nrow(df) == 0) return("--")
+  paste0("$", formatC(mean(df$TOTAL_AMOUNT), format = "f", digits = 2, big.mark = ","))
+})
+```
+:::
+
+## Row
+
+### Column
+
+```{r}
+#| title: Sales by Category
+plotlyOutput("sf_chart_category")
+```
+
+```{r}
+#| context: server
+output$sf_chart_category <- renderPlotly({
+  df <- sf_filtered()
+  if (is.null(df)) return(plot_ly() |> layout(title = "Loading..."))
+  agg <- df |> group_by(CATEGORY) |> summarise(total = sum(TOTAL_AMOUNT), .groups = "drop")
+  plot_ly(agg, x = ~CATEGORY, y = ~total, color = ~CATEGORY, type = "bar") |>
+    layout(xaxis = list(title = "Category"), yaxis = list(title = "Sales ($)"))
+})
+```
+
+### Column
+
+```{r}
+#| title: Sales by Region
+plotlyOutput("sf_chart_region")
+```
+
+```{r}
+#| context: server
+output$sf_chart_region <- renderPlotly({
+  df <- sf_filtered()
+  if (is.null(df)) return(plot_ly() |> layout(title = "Loading..."))
+  agg <- df |> group_by(REGION) |> summarise(total = sum(TOTAL_AMOUNT), .groups = "drop")
+  plot_ly(agg, labels = ~REGION, values = ~total, type = "pie")
+})
+```
+
+# Databricks Bakehouse
+
+## Row
+
+::: {.valuebox title="DB Revenue" icon="currency-dollar" color="primary"}
+```{r}
+renderText({
+  df <- db_filtered()
+  if (is.null(df)) return("--")
+  paste0("$", formatC(sum(df$totalprice), format = "f", digits = 2, big.mark = ","))
+})
+```
+:::
+
+::: {.valuebox title="DB Orders" icon="cart" color="info"}
+```{r}
+renderText({
+  df <- db_filtered()
+  if (is.null(df)) return("--")
+  formatC(nrow(df), format = "d", big.mark = ",")
+})
+```
+:::
+
+::: {.valuebox title="DB Franchises" icon="shop" color="warning"}
+```{r}
+renderText({
+  df <- db_filtered()
+  if (is.null(df)) return("--")
+  as.character(length(unique(df$franchise_name)))
+})
+```
+:::
+
+## Row
+
+### Column
+
+```{r}
+#| title: Revenue by Franchise
+plotlyOutput("db_chart_franchise")
+```
+
+```{r}
+#| context: server
+output$db_chart_franchise <- renderPlotly({
+  df <- db_filtered()
+  if (is.null(df)) return(plot_ly() |> layout(title = "Loading..."))
+  agg <- df |>
+    group_by(franchise_name) |>
+    summarise(revenue = sum(totalprice), .groups = "drop") |>
+    arrange(revenue)
+  agg$franchise_name <- factor(agg$franchise_name, levels = agg$franchise_name)
+  plot_ly(agg, x = ~revenue, y = ~franchise_name, type = "bar", orientation = "h") |>
+    layout(xaxis = list(title = "Revenue ($)"), yaxis = list(title = "Franchise"))
+})
+```
+
+### Column
+
+```{r}
+#| title: Revenue by Continent
+plotlyOutput("db_chart_continent")
+```
+
+```{r}
+#| context: server
+output$db_chart_continent <- renderPlotly({
+  df <- db_filtered()
+  if (is.null(df)) return(plot_ly() |> layout(title = "Loading..."))
+  agg <- df |> group_by(continent) |> summarise(revenue = sum(totalprice), .groups = "drop")
+  plot_ly(agg, labels = ~continent, values = ~revenue, type = "pie")
+})
+```
+
+# Combined Trends
+
+## Row
+
+```{r}
+#| title: Monthly Trends - Both Sources
+plotlyOutput("combined_trend")
+```
+
+```{r}
+#| context: server
+output$combined_trend <- renderPlotly({
+  df_sf <- sf_filtered()
+  df_db <- db_filtered()
+  if (is.null(df_sf) && is.null(df_db)) {
+    return(plot_ly() |> layout(title = "Loading..."))
+  }
+
+  p <- plot_ly()
+  if (!is.null(df_sf)) {
+    agg_sf <- df_sf |> group_by(MONTH) |> summarise(total = sum(TOTAL_AMOUNT), .groups = "drop") |> arrange(MONTH)
+    p <- p |> add_trace(data = agg_sf, x = ~MONTH, y = ~total, type = "scatter",
+                        mode = "lines+markers", name = "Snowflake Sales")
+  }
+  if (!is.null(df_db)) {
+    agg_db <- df_db |> group_by(month) |> summarise(total = sum(totalprice), .groups = "drop") |> arrange(month)
+    p <- p |> add_trace(data = agg_db, x = ~month, y = ~total, type = "scatter",
+                        mode = "lines+markers", name = "Databricks Revenue")
+  }
+  p |> layout(xaxis = list(title = "Month"), yaxis = list(title = "Amount ($)"))
+})
+```
