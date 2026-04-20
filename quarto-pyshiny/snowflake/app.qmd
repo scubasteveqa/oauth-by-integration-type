@@ -1,0 +1,183 @@
+---
+title: "Snowflake Dashboard (find by type)"
+format: dashboard
+server: shiny
+---
+
+```{python}
+#| context: setup
+import os
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import snowflake.connector
+from posit import connect
+from posit.connect.oauth import types
+from shiny import reactive, render, ui
+from shiny.express import input, session
+from shinywidgets import render_widget
+
+
+def fetch_snowflake(access_token: str) -> pd.DataFrame:
+    conn = snowflake.connector.connect(
+        account=os.environ["SNOWFLAKE_ACCOUNT"],
+        token=access_token,
+        authenticator="oauth",
+        warehouse=os.environ["SNOWFLAKE_WAREHOUSE"],
+        database=os.environ["SNOWFLAKE_DATABASE"],
+        schema=os.environ["SNOWFLAKE_SCHEMA"],
+    )
+    try:
+        df = pd.read_sql("SELECT * FROM SALES", conn)
+    finally:
+        conn.close()
+    df.columns = df.columns.str.upper()
+    df["SALE_DATE"] = pd.to_datetime(df["SALE_DATE"])
+    df["MONTH"] = df["SALE_DATE"].dt.to_period("M").astype(str)
+    return df
+```
+
+# {.sidebar}
+
+OAuth via `find_by(integration_type=SNOWFLAKE)`
+
+```{python}
+ui.input_action_button("load_data", "Refresh Data", class_="btn-primary w-100")
+ui.tags.script(
+    "setTimeout(function() { document.getElementById('load_data').click(); }, 500);"
+)
+ui.tags.hr()
+ui.input_select("category", "Category", choices=["All"], selected="All")
+ui.input_select("region", "Region", choices=["All"], selected="All")
+```
+
+```{python}
+raw_data = reactive.Value(None)
+
+@reactive.effect
+def load_all():
+    input.load_data()
+    session_token = session.http_conn.headers.get("Posit-Connect-User-Session-Token")
+    if not session_token:
+        ui.notification_show("No session token found. Deploy on Posit Connect.", type="error")
+        return
+
+    client = connect.Client()
+    current_content = client.content.get()
+
+    sf_assoc = current_content.oauth.associations.find_by(
+        integration_type=types.OAuthIntegrationType.SNOWFLAKE
+    )
+    if sf_assoc is None:
+        ui.notification_show("No Snowflake integration found on this content", type="error")
+        return
+
+    sf_guid = sf_assoc.get("oauth_integration_guid")
+
+    try:
+        creds = client.oauth.get_credentials(session_token, audience=sf_guid)
+        df = fetch_snowflake(creds["access_token"])
+        raw_data.set(df)
+
+        categories = ["All"] + sorted(df["CATEGORY"].dropna().unique().tolist())
+        regions = ["All"] + sorted(df["REGION"].dropna().unique().tolist())
+        ui.update_select("category", choices=categories, selected="All")
+        ui.update_select("region", choices=regions, selected="All")
+
+        ui.notification_show(f"Snowflake: {len(df)} rows", type="message")
+    except Exception as e:
+        ui.notification_show(f"Snowflake error: {e}", type="error", duration=10)
+
+@reactive.calc
+def filtered():
+    df = raw_data()
+    if df is None:
+        return None
+    if input.category() != "All":
+        df = df[df["CATEGORY"] == input.category()]
+    if input.region() != "All":
+        df = df[df["REGION"] == input.region()]
+    return df
+```
+
+# Snowflake Sales
+
+## Row
+
+::: {.valuebox title="Total Sales" icon="currency-dollar" color="primary"}
+```{python}
+@render.text
+def total_sales():
+    df = filtered()
+    return f"${df['TOTAL_AMOUNT'].sum():,.2f}" if df is not None else "--"
+```
+:::
+
+::: {.valuebox title="Orders" icon="cart" color="info"}
+```{python}
+@render.text
+def total_orders():
+    df = filtered()
+    return f"{len(df):,}" if df is not None else "--"
+```
+:::
+
+::: {.valuebox title="Avg Order" icon="calculator" color="success"}
+```{python}
+@render.text
+def avg_order():
+    df = filtered()
+    if df is None or len(df) == 0:
+        return "--"
+    return f"${df['TOTAL_AMOUNT'].mean():,.2f}"
+```
+:::
+
+## Row
+
+### Column
+
+```{python}
+#| title: Sales by Category
+@render_widget
+def chart_category():
+    df = filtered()
+    if df is None:
+        fig = go.Figure()
+        fig.update_layout(title="Loading...", template="plotly_white")
+        return fig
+    agg = df.groupby("CATEGORY", as_index=False)["TOTAL_AMOUNT"].sum()
+    return px.bar(agg, x="CATEGORY", y="TOTAL_AMOUNT", color="CATEGORY",
+                  labels={"TOTAL_AMOUNT": "Sales ($)", "CATEGORY": "Category"})
+```
+
+### Column
+
+```{python}
+#| title: Sales by Region
+@render_widget
+def chart_region():
+    df = filtered()
+    if df is None:
+        fig = go.Figure()
+        fig.update_layout(title="Loading...", template="plotly_white")
+        return fig
+    agg = df.groupby("REGION", as_index=False)["TOTAL_AMOUNT"].sum()
+    return px.pie(agg, names="REGION", values="TOTAL_AMOUNT")
+```
+
+## Row
+
+```{python}
+#| title: Monthly Sales Trend
+@render_widget
+def chart_trend():
+    df = filtered()
+    if df is None:
+        fig = go.Figure()
+        fig.update_layout(title="Loading...", template="plotly_white")
+        return fig
+    agg = df.groupby("MONTH", as_index=False)["TOTAL_AMOUNT"].sum().sort_values("MONTH")
+    return px.line(agg, x="MONTH", y="TOTAL_AMOUNT", markers=True,
+                   labels={"TOTAL_AMOUNT": "Sales ($)", "MONTH": "Month"})
+```
