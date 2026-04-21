@@ -21,7 +21,7 @@
                                                                                                                                                                                  
   Snowflake Staging environment variables are stored in **1Password**:
 
-  > **1Password → Snowflake → Staging → Env Variables**
+  **1Password → Snowflake → Staging → Env Variables**
                                                                                                                                                                                  
   Required variables:
                                                                                                                                                                                                                             
